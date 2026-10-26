@@ -5,6 +5,7 @@ from qfluentwidgets import SegmentedWidget
 
 from videocaptioner.core.llm.context import generate_task_id
 from videocaptioner.ui.task_factory import TaskFactory
+from videocaptioner.ui.view.subtitle_edit_interface import SubtitleEditInterface
 from videocaptioner.ui.view.subtitle_interface import SubtitleInterface
 from videocaptioner.ui.view.task_creation_interface import TaskCreationInterface
 from videocaptioner.ui.view.transcription_interface import TranscriptionInterface
@@ -35,6 +36,7 @@ class HomeInterface(QWidget):
         self.task_creation_interface = TaskCreationInterface(self)
         self.transcription_interface = TranscriptionInterface(self)
         self.subtitle_optimization_interface = SubtitleInterface(self)
+        self.subtitle_edit_interface = SubtitleEditInterface(self)
         self.video_synthesis_interface = VideoSynthesisInterface(self)
 
         self.addSubInterface(
@@ -47,6 +49,11 @@ class HomeInterface(QWidget):
             self.subtitle_optimization_interface,
             "SubtitleInterface",
             self.tr("字幕优化与翻译"),
+        )
+        self.addSubInterface(
+            self.subtitle_edit_interface,
+            "SubtitleEditInterface",
+            self.tr("字幕剪辑"),
         )
         self.addSubInterface(
             self.video_synthesis_interface,
@@ -63,12 +70,14 @@ class HomeInterface(QWidget):
         self.pivot.setCurrentItem("TaskCreationInterface")
 
         self.task_creation_interface.finished.connect(self.switch_to_transcription)
-        self.transcription_interface.finished.connect(
-            self.switch_to_subtitle_optimization
-        )
-        self.subtitle_optimization_interface.finished.connect(
-            self.switch_to_video_synthesis
-        )
+        self.transcription_interface.finished.connect(self.switch_to_subtitle_optimization)
+        self.subtitle_optimization_interface.finished.connect(self.switch_to_subtitle_edit)
+        self.subtitle_edit_interface.finished.connect(self.switch_to_video_synthesis)
+
+    def switch_to_subtitle_edit(self, video_path, subtitle_path):
+        if self.subtitle_edit_interface.load_task(video_path, subtitle_path):
+            self.stackedWidget.setCurrentWidget(self.subtitle_edit_interface)
+            self.pivot.setCurrentItem("SubtitleEditInterface")
 
     def switch_to_transcription(self, file_path):
         # 流程开始，生成新的 task_id
@@ -124,5 +133,6 @@ class HomeInterface(QWidget):
         self.task_creation_interface.close()
         self.transcription_interface.close()
         self.subtitle_optimization_interface.close()
+        self.subtitle_edit_interface.close()
         self.video_synthesis_interface.close()
         super().closeEvent(event)

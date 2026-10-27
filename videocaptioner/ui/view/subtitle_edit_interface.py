@@ -10,15 +10,12 @@ from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
 from PyQt5.QtMultimediaWidgets import QVideoWidget
 from PyQt5.QtWidgets import (
     QAbstractScrollArea,
-    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
     QMessageBox,
-    QPlainTextEdit,
     QShortcut,
-    QSlider,
     QSplitter,
     QStackedWidget,
     QTableWidgetItem,
@@ -27,10 +24,28 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from qfluentwidgets import BodyLabel, PrimaryPushButton, PushButton, TableWidget
+from qfluentwidgets import (
+    Action,
+    BodyLabel,
+    CaptionLabel,
+    CardWidget,
+    CommandBar,
+    DoubleSpinBox,
+    PlainTextEdit,
+    PrimaryPushButton,
+    PushButton,
+    Slider,
+    SmoothScrollDelegate,
+    TableWidget,
+    isDarkTheme,
+    qconfig,
+    themeColor,
+)
+from qfluentwidgets import FluentIcon as FIF
 
 from videocaptioner.config import APPDATA_PATH
 from videocaptioner.core.subtitle.timeline import SubtitleTimeline, adjusted_times
+from videocaptioner.ui.common.config import cfg
 from videocaptioner.ui.components.ffmpeg_preview import FFmpegPreview, PreviewFrame
 
 
@@ -63,12 +78,17 @@ class SubtitleTrack(QAbstractScrollArea):
         self.scale = 80
         self.current = -1
         self.drag = None
-        self.setMinimumHeight(220)
-        self.setMaximumHeight(260)
+        self.setMinimumHeight(196)
+        self.setMaximumHeight(240)
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
+        self.setFrameShape(self.NoFrame)
+        self.scroll_delegate = SmoothScrollDelegate(self)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.horizontalScrollBar().valueChanged.connect(lambda _: self.viewport().update())
+        qconfig.themeChangedFinished.connect(self.refresh)
+        cfg.themeColorChanged.connect(self.refresh)
         self.setAccessibleName("字幕时间轨道")
 
     def total(self):
@@ -105,7 +125,7 @@ class SubtitleTrack(QAbstractScrollArea):
         start, end = seg.start_time, seg.end_time
         if self.drag and self.drag[0] == index:
             start, end = self.drag[4:6]
-        return QRectF(self.x(start), 48 + lane * 65, max(3, (end - start) * self.scale / 1000), 49)
+        return QRectF(self.x(start), 40 + lane * 58, max(3, (end - start) * self.scale / 1000), 44)
 
     def lanes(self, index):
         seg = self.document.data.segments[index]
@@ -114,50 +134,68 @@ class SubtitleTrack(QAbstractScrollArea):
         return [0, 1] if seg.translated_text else [0]
 
     def paintEvent(self, event):
+        dark = isDarkTheme()
+        accent = themeColor()
+        background = QColor("#292929" if dark else "#ffffff")
+        surface = QColor("#323232" if dark else "#f7f7f7")
+        border = QColor("#454545" if dark else "#e5e5e5")
+        text_color = QColor("#ffffff" if dark else "#1a1a1a")
+        muted = QColor("#c5c5c5" if dark else "#606060")
         p = QPainter(self.viewport())
         p.setRenderHint(QPainter.Antialiasing)
-        p.fillRect(self.viewport().rect(), QColor("#171d29"))
+        p.fillRect(self.viewport().rect(), background)
         p.setClipRect(80, 0, max(0, self.viewport().width() - 80), self.viewport().height())
+        p.fillRect(80, 0, self.viewport().width() - 80, 32, surface)
+        p.fillRect(80, 94, self.viewport().width() - 80, 54, surface)
         step = 1000 * max(1, math.ceil(65 / self.scale))
         first = self.ms(80) // step * step
         for ms in range(first, self.ms(self.viewport().width()) + step, step):
             x = self.x(ms)
-            p.setPen(QColor("#30394a"))
-            p.drawLine(int(x), 30, int(x), 183)
-            p.setPen(QColor("#aab6ca"))
+            p.setPen(border)
+            p.drawLine(int(x), 30, int(x), 153)
+            p.setPen(muted)
             p.drawText(QRectF(x + 4, 4, 90, 22), time_label(ms)[:-4])
         for index, seg in enumerate(self.document.data):
             for lane in self.lanes(index):
                 rect = self.clip_rect(index, lane)
                 if rect.right() < 80 or rect.left() > self.viewport().width():
                     continue
-                p.setBrush(QColor("#237f96" if lane == 0 else "#6956ab"))
+                fill = QColor(accent)
+                fill.setAlpha(50 if index == self.current else 26 if lane == 0 else 15)
+                p.setBrush(fill)
                 p.setPen(
                     QPen(
-                        QColor("#f8d376" if index == self.current else "#74b4c4"),
+                        accent if index == self.current else border,
                         2 if index == self.current else 1,
                     )
                 )
                 p.drawRoundedRect(rect, 5, 5)
-                p.setPen(QColor("#ffffff"))
+                p.setPen(text_color)
                 text = self.document.text(index, lane == 1 and not self.document.ass_events)
                 p.save()
                 p.setClipRect(rect.adjusted(7, 0, -7, 0), Qt.IntersectClip)
                 p.drawText(rect.adjusted(9, 4, -6, -4), Qt.AlignVCenter, text.replace("\n", " / "))
                 p.restore()
+                p.setPen(accent if index == self.current else muted)
                 for x in (rect.left() + 4, rect.right() - 4):
                     p.drawLine(int(x), int(rect.top() + 17), int(x), int(rect.bottom() - 17))
-        p.setPen(QPen(QColor("#ff6b72"), 2))
-        p.drawLine(int(self.x(self.position)), 28, int(self.x(self.position)), 184)
+        p.setPen(QPen(accent, 2))
+        p.drawLine(int(self.x(self.position)), 28, int(self.x(self.position)), 154)
         p.setClipping(False)
-        p.fillRect(0, 0, 79, self.viewport().height(), QColor("#202837"))
-        p.setPen(QColor("#c9d5e6"))
-        p.drawText(QRectF(8, 48, 65, 49), Qt.AlignVCenter, "字幕")
-        p.drawText(QRectF(8, 113, 65, 49), Qt.AlignVCenter, "副字幕")
+        p.fillRect(0, 0, 79, self.viewport().height(), surface)
+        p.setPen(border)
+        p.drawLine(79, 0, 79, self.viewport().height())
+        p.setPen(text_color)
+        p.drawText(QRectF(8, 40, 65, 44), Qt.AlignVCenter, "字幕")
+        p.drawText(QRectF(8, 98, 65, 44), Qt.AlignVCenter, "副字幕")
+        p.setPen(muted)
         p.drawText(
-            QRectF(8, 182, self.viewport().width() - 8, 22),
+            QRectF(8, 163, self.viewport().width() - 8, 22),
             "拖动边缘调时长 · 拖动中间移动 · 点击刻度定位",
         )
+        p.setBrush(Qt.NoBrush)
+        p.setPen(border)
+        p.drawRoundedRect(QRectF(self.viewport().rect()).adjusted(0.5, 0.5, -0.5, -0.5), 6, 6)
 
     def hit(self, point):
         if point.x() < 80:
@@ -254,6 +292,8 @@ class SubtitleEditInterface(QWidget):
 
     def __init__(self, parent=None, draft_path=None):
         super().__init__(parent)
+        self.setObjectName("SubtitleEditInterface")
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.document = SubtitleTimeline()
         self.video_path = ""
         self.subtitle_path = ""
@@ -278,6 +318,8 @@ class SubtitleEditInterface(QWidget):
         self.autosave.setInterval(300)
         self.autosave.timeout.connect(self.save_draft)
         self.setup_ui()
+        qconfig.themeChangedFinished.connect(self.update_theme)
+        self.update_theme()
         self.connect_player()
         self.player.error.connect(self.media_error)
         self.undo_stack.canUndoChanged.connect(self.undo_button.setEnabled)
@@ -290,6 +332,10 @@ class SubtitleEditInterface(QWidget):
         QApplication.instance().aboutToQuit.connect(self.shutdown)
         self.restore_draft()
 
+    def update_theme(self):
+        background = "#202020" if isDarkTheme() else "#f9f9f9"
+        self.setStyleSheet(f"#SubtitleEditInterface {{ background: {background}; }}")
+
     def connect_player(self):
         self.player.positionChanged.connect(self.position_changed)
         self.player.durationChanged.connect(self.duration_changed)
@@ -297,44 +343,48 @@ class SubtitleEditInterface(QWidget):
 
     def play_state_changed(self, state):
         self.play_button.setText("暂停" if state == QMediaPlayer.PlayingState else "播放")
+        self.play_button.setIcon(FIF.PAUSE if state == QMediaPlayer.PlayingState else FIF.PLAY)
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(6)
         toolbar = QHBoxLayout()
-        for text, slot in [
-            ("打开视频", self.open_video),
-            ("导入字幕", self.open_subtitles),
-            ("另存字幕", self.save_as),
+        self.command_bar = CommandBar(self)
+        self.command_bar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        for icon, text, slot in [
+            (FIF.FOLDER, "打开视频", self.open_video),
+            (FIF.ADD, "导入字幕", self.open_subtitles),
+            (FIF.SAVE, "另存字幕", self.save_as),
         ]:
-            button = PushButton(text, self)
-            button.clicked.connect(slot)
-            toolbar.addWidget(button)
-        self.undo_button = PushButton("撤销", self)
-        self.redo_button = PushButton("重做", self)
-        self.undo_button.clicked.connect(self.undo_stack.undo)
-        self.redo_button.clicked.connect(self.undo_stack.redo)
+            self.command_bar.addAction(Action(icon, text, triggered=slot))
+        self.command_bar.addSeparator()
+        self.undo_button = Action(FIF.RETURN, "撤销", triggered=self.undo_stack.undo)
+        self.redo_button = Action(FIF.ROTATE, "重做", triggered=self.undo_stack.redo)
         self.undo_button.setEnabled(False)
         self.redo_button.setEnabled(False)
-        toolbar.addWidget(self.undo_button)
-        toolbar.addWidget(self.redo_button)
-        toolbar.addStretch()
-        self.continue_button = PrimaryPushButton("保存并继续合成", self)
+        self.command_bar.addAction(self.undo_button)
+        self.command_bar.addAction(self.redo_button)
+        toolbar.addWidget(self.command_bar, 1)
+        self.continue_button = PrimaryPushButton("保存并继续合成", self, icon=FIF.CHEVRON_RIGHT)
+        self.continue_button.setFixedHeight(34)
         self.continue_button.clicked.connect(self.continue_synthesis)
         toolbar.addWidget(self.continue_button)
         layout.addLayout(toolbar)
-        self.files_label = BodyLabel("导入视频和字幕，或等待上一步完成", self)
+        self.files_label = CaptionLabel("导入视频和字幕，或等待上一步完成", self)
         self.files_label.setWordWrap(True)
         layout.addWidget(self.files_label)
 
         split = QSplitter(Qt.Horizontal, self)
-        preview = QWidget(split)
+        split.setHandleWidth(12)
+        split.setChildrenCollapsible(False)
+        preview = CardWidget(split)
         preview_layout = QVBoxLayout(preview)
-        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setContentsMargins(6, 6, 6, 6)
         preview_layout.setSpacing(0)
         self.video_widget = QVideoWidget(preview)
         self.video_widget.setMinimumSize(240, 140)
-        self.video_widget.setStyleSheet("background: #10151f;")
+        self.video_widget.setStyleSheet("background: black;")
         self.player.setVideoOutput(self.video_widget)
         self.preview_stack = QStackedWidget(preview)
         self.preview_stack.addWidget(self.video_widget)
@@ -346,32 +396,35 @@ class SubtitleEditInterface(QWidget):
         self.caption.setWordWrap(True)
         self.caption.setMinimumHeight(58)
         self.caption.setStyleSheet(
-            "background: #10151f; color: white; font-size: 17px; padding: 8px;"
+            "background: black; color: white; font-size: 17px; padding: 8px;"
         )
         self.caption.setTextFormat(Qt.PlainText)
         preview_layout.addWidget(self.caption)
         split.addWidget(preview)
 
-        inspector = QWidget(split)
+        inspector = CardWidget(split)
         form = QFormLayout(inspector)
-        self.start_input, self.end_input = QDoubleSpinBox(self), QDoubleSpinBox(self)
+        form.setContentsMargins(12, 12, 12, 12)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(6)
+        self.start_input, self.end_input = DoubleSpinBox(self), DoubleSpinBox(self)
         for spin, name in [(self.start_input, "字幕开始时间"), (self.end_input, "字幕结束时间")]:
             spin.setRange(0, 359999.999)
             spin.setDecimals(3)
             spin.setSingleStep(0.1)
             spin.setSuffix(" 秒")
             spin.setAccessibleName(name)
-        form.addRow("开始", self.start_input)
-        form.addRow("结束", self.end_input)
-        self.text_input, self.translation_input = QPlainTextEdit(self), QPlainTextEdit(self)
-        self.text_input.setMaximumHeight(70)
+        form.addRow(BodyLabel("开始", self), self.start_input)
+        form.addRow(BodyLabel("结束", self), self.end_input)
+        self.text_input, self.translation_input = PlainTextEdit(self), PlainTextEdit(self)
+        self.text_input.setMaximumHeight(64)
         self.translation_input.setMaximumHeight(60)
-        form.addRow("字幕", self.text_input)
-        form.addRow("译文", self.translation_input)
+        form.addRow(BodyLabel("字幕", self), self.text_input)
+        form.addRow(BodyLabel("译文", self), self.translation_input)
         self.translation_label = form.labelForField(self.translation_input)
         self.translation_label.hide()
         self.translation_input.hide()
-        self.apply_button = PushButton("应用修改", self)
+        self.apply_button = PushButton("应用修改", self, icon=FIF.ACCEPT)
         self.apply_button.clicked.connect(self.apply_inputs)
         form.addRow(self.apply_button)
         split.addWidget(inspector)
@@ -380,16 +433,16 @@ class SubtitleEditInterface(QWidget):
         layout.addWidget(split, 3)
 
         transport = QHBoxLayout()
-        self.play_button = PushButton("播放", self)
+        self.play_button = PushButton("播放", self, icon=FIF.PLAY)
         self.play_button.clicked.connect(self.toggle_play)
         transport.addWidget(self.play_button)
-        self.backend_label = BodyLabel("", self)
+        self.backend_label = CaptionLabel("", self)
         transport.addWidget(self.backend_label)
         self.time_display = BodyLabel("00:00:00.000 / 00:00:00.000", self)
         transport.addWidget(self.time_display)
         transport.addStretch()
         transport.addWidget(BodyLabel("轨道缩放", self))
-        self.zoom = QSlider(Qt.Horizontal, self)
+        self.zoom = Slider(Qt.Horizontal, self)
         self.zoom.setRange(20, 300)
         self.zoom.setValue(80)
         self.zoom.setMaximumWidth(160)
@@ -404,7 +457,7 @@ class SubtitleEditInterface(QWidget):
 
         self.table = TableWidget(self)
         self.table.setColumnCount(4)
-        self.table.setMinimumHeight(120)
+        self.table.setMinimumHeight(100)
         self.table.setHorizontalHeaderLabels(["开始", "结束", "时长", "字幕内容"])
         self.table.setSelectionBehavior(self.table.SelectRows)
         self.table.setSelectionMode(self.table.SingleSelection)
@@ -415,7 +468,7 @@ class SubtitleEditInterface(QWidget):
         self.table.setColumnWidth(2, 75)
         self.table.itemSelectionChanged.connect(self.table_selected)
         layout.addWidget(self.table, 2)
-        self.status = BodyLabel("拖动字幕左右边缘调整时长；右侧可精确编辑到毫秒。", self)
+        self.status = CaptionLabel("拖动字幕左右边缘调整时长；右侧可精确编辑到毫秒。", self)
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         self.set_controls()

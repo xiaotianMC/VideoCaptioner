@@ -8,6 +8,7 @@ from videocaptioner.core.entities import (
     FullProcessTask,
     LLMServiceEnum,
     SubtitleConfig,
+    SubtitleRenderModeEnum,
     SubtitleTask,
     SynthesisConfig,
     SynthesisTask,
@@ -15,6 +16,7 @@ from videocaptioner.core.entities import (
     TranscribeTask,
     TranscriptAndSubtitleTask,
 )
+from videocaptioner.core.subtitle.drawing import contains_ass_drawing
 from videocaptioner.ui.common.config import cfg
 
 
@@ -228,6 +230,15 @@ class TaskFactory:
             ass_style=TaskFactory.get_ass_style(cfg.subtitle_style_name.value) if use_style else "",
             rounded_style=TaskFactory.get_rounded_style() if use_style else None,
         )
+        if (
+            Path(subtitle_path).suffix.lower() == ".ass"
+            and Path(subtitle_path).is_file()
+            and contains_ass_drawing(
+                Path(subtitle_path).read_text(encoding="utf-8-sig", errors="replace")
+            )
+        ):
+            config.soft_subtitle = False
+            config.render_mode = SubtitleRenderModeEnum.ASS_STYLE
 
         task = SynthesisTask(
             queued_at=datetime.datetime.now(),

@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 from videocaptioner.core.asr.asr_data import ASRData, ASRDataSeg
+from videocaptioner.core.subtitle.drawing import AssRectangle, contains_ass_drawing
 
 
 class SubtitleTimeline:
@@ -90,7 +91,68 @@ class SubtitleTimeline:
     def text(self, index, translation=False):
         seg = self.data.segments[index]
         text = seg.translated_text if translation else seg.text
+        if self.rectangle(index) and not translation:
+            return "矩形"
+        if contains_ass_drawing(text):
+            return "ASS 图形"
         return re.sub(r"\{[^}]*\}", "", text).replace(r"\n", "\n").replace(r"\h", " ")
+
+    def rectangle(self, index):
+        return AssRectangle.from_ass(self.data.segments[index].text)
+
+    def has_drawings(self):
+        return any(contains_ass_drawing(seg.text) for seg in self.data)
+
+    def resolution(self):
+        defaults = (384, 288) if self.ass_lines else (1280, 720)
+        content = "\n".join(self.ass_lines)
+        return tuple(
+            int(m[1])
+            if (m := re.search(rf"(?im)^PlayRes{axis}:\s*([1-9]\d*)\s*$", content))
+            else default
+            for axis, default in zip(("X", "Y"), defaults)
+        )
+
+    def add_rectangle(self, rectangle, start, end):
+        width, height = self.resolution()
+        if rectangle.x + rectangle.width > width or rectangle.y + rectangle.height > height:
+            raise ValueError("矩形不能超出画面范围")
+        if start < 0 or end <= start:
+            raise ValueError("矩形显示时间无效")
+        start = int(start) // 10 * 10
+        end = max(start + 10, int(end) // 10 * 10)
+        text = rectangle.to_ass()
+        if self.ass_events:
+            # Insert before any following [Fonts]/[Graphics] section, retaining its contents.
+            index = max(event[0] for event in self.ass_events) + 1
+            fields = list(self.ass_events[-1][1])
+            while index < len(self.ass_lines) and not self.ass_lines[index].strip().startswith("["):
+                if self.ass_lines[index].strip().lower().startswith("format:"):
+                    fields = [
+                        field.strip().lower()
+                        for field in self.ass_lines[index].split(":", 1)[1].split(",")
+                    ]
+                index += 1
+            if fields[-1] != "text" or not {"start", "end", "style"}.issubset(fields):
+                raise ValueError("ASS Events 的字段格式不支持添加图形")
+            style_values = dict(zip(self.ass_events[0][1], self.ass_events[0][2]))
+            values = {
+                "layer": "0",
+                "start": ASRDataSeg._ms_to_ass_ts(start),
+                "end": ASRDataSeg._ms_to_ass_ts(end),
+                "style": style_values["style"],
+                "name": "",
+                "marginl": "0",
+                "marginr": "0",
+                "marginv": "0",
+                "effect": "",
+                "text": text,
+            }
+            row = [values.get(field, "") for field in fields]
+            self.ass_lines.insert(index, "Dialogue: " + ",".join(row))
+            self.ass_events.append((index, fields, row))
+        self.data.segments.append(ASRDataSeg(text, start, end))
+        return len(self.data.segments) - 1
 
     def export_text(self, suffix):
         self.validate()
@@ -105,6 +167,8 @@ class SubtitleTimeline:
             return "\n".join(lines) + "\n"
         data = ASRData(list(self.data.segments))
         if suffix.lower() == ".srt":
+            if self.has_drawings():
+                raise ValueError("SRT 不支持图形，请保存为 ASS 字幕")
             return data.to_srt()
         if suffix.lower() == ".ass":
             return data.to_ass()
@@ -142,7 +206,10 @@ class SubtitleTimeline:
                 or not {"start", "end", "style", "text"}.issubset(fields)
             ):
                 raise ValueError("ASS 草稿的事件映射无效")
-        document.validate()
+        if document.data.segments:
+            document.validate()
+        elif document.ass_events or document.ass_lines:
+            raise ValueError("ASS 草稿中没有字幕事件")
         return document
 
 

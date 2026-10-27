@@ -1,40 +1,133 @@
 """Silent frame preview for systems without a working Qt video decoder."""
 
+import json
 import shutil
 
-from PyQt5.QtCore import QObject, QProcess, QRectF, Qt, pyqtSignal
-from PyQt5.QtGui import QImage, QPainter
+from PyQt5.QtCore import QObject, QPointF, QProcess, QRectF, QSize, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QImage, QPainter, QPen
 from PyQt5.QtMultimedia import QMediaPlayer
 from PyQt5.QtWidgets import QWidget
 
 
 class PreviewFrame(QWidget):
+    rectangleDrawn = pyqtSignal(int, int, int, int)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.image = QImage()
+        self.video_size = QSize(16, 9)
+        self.canvas_size = QSize(1280, 720)
+        self.rectangles = []
+        self.drawing_enabled = False
+        self.anchor = self.cursor_point = None
         self.setMinimumSize(240, 140)
 
     def set_image(self, image):
         self.image = image
         self.update()
 
+    def set_video_size(self, size):
+        self.video_size = size
+        self.update()
+
+    def video_rect(self):
+        size = self.video_size.scaled(self.size(), Qt.KeepAspectRatio)
+        return QRectF(
+            (self.width() - size.width()) / 2,
+            (self.height() - size.height()) / 2,
+            size.width(),
+            size.height(),
+        )
+
+    def set_rectangles(self, rectangles, resolution):
+        self.rectangles = rectangles
+        self.canvas_size = QSize(*resolution)
+        self.update()
+
+    def set_drawing(self, enabled):
+        self.drawing_enabled = enabled
+        self.anchor = self.cursor_point = None
+        self.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
+        self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), Qt.black)
         if not self.image.isNull():
-            size = self.image.size().scaled(self.size(), Qt.KeepAspectRatio)
-            rect = QRectF(
-                (self.width() - size.width()) / 2,
-                (self.height() - size.height()) / 2,
+            rect = self.video_rect()
+            # FFmpeg pads raw frames; exclude that padding when mapping script coordinates.
+            size = self.video_size.scaled(self.image.size(), Qt.KeepAspectRatio)
+            source = QRectF(
+                (self.image.width() - size.width()) / 2,
+                (self.image.height() - size.height()) / 2,
                 size.width(),
                 size.height(),
             )
-            painter.drawImage(rect, self.image)
+            painter.drawImage(rect, self.image, source)
+            painter.setClipRect(rect)
+            sx, sy = (
+                rect.width() / self.canvas_size.width(),
+                rect.height() / self.canvas_size.height(),
+            )
+            for shape in self.rectangles:
+                color = QColor(shape.color)
+                color.setAlpha(round(255 * shape.opacity / 100))
+                painter.fillRect(
+                    QRectF(
+                        rect.x() + shape.x * sx,
+                        rect.y() + shape.y * sy,
+                        shape.width * sx,
+                        shape.height * sy,
+                    ),
+                    color,
+                )
+            if self.anchor is not None:
+                painter.setBrush(QColor(0, 166, 184, 70))
+                painter.setPen(QPen(Qt.white, 1, Qt.DashLine))
+                painter.drawRect(QRectF(self.anchor, self.cursor_point).normalized())
+
+    def clamp_point(self, point):
+        rect = self.video_rect()
+        return QPointF(
+            max(rect.left(), min(point.x(), rect.right())),
+            max(rect.top(), min(point.y(), rect.bottom())),
+        )
+
+    def mousePressEvent(self, event):
+        if (
+            self.drawing_enabled
+            and not self.image.isNull()
+            and event.button() == Qt.LeftButton
+            and self.video_rect().contains(event.pos())
+        ):
+            self.anchor = self.cursor_point = QPointF(event.pos())
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if self.anchor is not None:
+            self.cursor_point = self.clamp_point(event.pos())
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if self.anchor is None or event.button() != Qt.LeftButton:
+            return
+        drawn = QRectF(self.anchor, self.clamp_point(event.pos())).normalized()
+        self.anchor = self.cursor_point = None
+        self.update()
+        if min(drawn.width(), drawn.height()) < 3:
+            return
+        rect = self.video_rect()
+        sx, sy = self.canvas_size.width() / rect.width(), self.canvas_size.height() / rect.height()
+        x, y = round((drawn.x() - rect.x()) * sx), round((drawn.y() - rect.y()) * sy)
+        right = min(self.canvas_size.width(), round((drawn.right() - rect.x()) * sx))
+        bottom = min(self.canvas_size.height(), round((drawn.bottom() - rect.y()) * sy))
+        self.rectangleDrawn.emit(x, y, max(1, right - x), max(1, bottom - y))
 
 
 class FFmpegPreview(QObject):
     positionChanged = pyqtSignal(int)
     durationChanged = pyqtSignal(int)
+    videoSizeChanged = pyqtSignal(QSize)
     stateChanged = pyqtSignal(int)
     frameReady = pyqtSignal(QImage)
     failed = pyqtSignal(str)
@@ -70,9 +163,9 @@ class FFmpegPreview(QObject):
                     "-v",
                     "error",
                     "-show_entries",
-                    "format=duration",
+                    "format=duration:stream=codec_type,width,height",
                     "-of",
-                    "default=noprint_wrappers=1:nokey=1",
+                    "json",
                     self.path,
                 ],
             )
@@ -80,10 +173,19 @@ class FFmpegPreview(QObject):
 
     def probed(self, code, *_):
         try:
-            value = float(bytes(self.probe.readAllStandardOutput()).decode().strip())
+            info = json.loads(bytes(self.probe.readAllStandardOutput()))
+            value = float(info["format"]["duration"])
             self._duration = max(0, round(value * 1000))
+            for stream in info.get("streams", []):
+                if (
+                    stream.get("codec_type") == "video"
+                    and stream.get("width", 0) > 0
+                    and stream.get("height", 0) > 0
+                ):
+                    self.videoSizeChanged.emit(QSize(stream["width"], stream["height"]))
+                    break
             self.durationChanged.emit(self._duration)
-        except (ValueError, OverflowError):
+        except (ValueError, KeyError, OverflowError):
             self.failed.emit("无法读取视频时长，请检查文件和 FFprobe。")
 
     def position(self):

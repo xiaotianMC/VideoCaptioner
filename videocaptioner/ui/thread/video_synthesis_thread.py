@@ -6,6 +6,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 from videocaptioner.core.asr.asr_data import ASRData
 from videocaptioner.core.entities import SynthesisTask
+from videocaptioner.core.subtitle.drawing import contains_ass_drawing
 from videocaptioner.core.utils.logger import setup_logger
 from videocaptioner.core.utils.video_utils import add_subtitles, add_subtitles_with_style
 
@@ -52,10 +53,23 @@ class VideoSynthesisThread(QThread):
             crf = video_quality.get_crf()
             preset = video_quality.get_preset()
 
-            # 读取字幕数据
-            asr_data = ASRData.from_subtitle_file(subtitle_file)
-
-            if config.soft_subtitle:
+            has_drawing = Path(subtitle_file).suffix.lower() == ".ass" and contains_ass_drawing(
+                Path(subtitle_file).read_text(encoding="utf-8-sig", errors="replace")
+            )
+            if has_drawing:
+                # Keep vector paths, script resolution and styles; mov_text cannot carry drawings.
+                self.progress.emit(5, self.tr("ASS 图形将以硬字幕合成"))
+                add_subtitles(
+                    video_file,
+                    subtitle_file,
+                    output_path,
+                    crf=crf,
+                    preset=preset,
+                    soft_subtitle=False,
+                    progress_callback=self.progress_callback,
+                )
+            elif config.soft_subtitle:
+                asr_data = ASRData.from_subtitle_file(subtitle_file)
                 # 软字幕：转为 SRT 后内嵌
                 with tempfile.NamedTemporaryFile(
                     mode="w",
@@ -82,6 +96,7 @@ class VideoSynthesisThread(QThread):
                     Path(temp_srt_path).unlink(missing_ok=True)
 
             else:
+                asr_data = ASRData.from_subtitle_file(subtitle_file)
                 # 硬字幕：使用样式配置渲染
                 add_subtitles_with_style(
                     video_path=video_file,

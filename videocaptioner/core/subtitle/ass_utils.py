@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+from .drawing import contains_ass_drawing
 from .font_utils import get_ass_to_pil_ratio, get_font
 from .text_utils import is_mainly_cjk, wrap_text
 
@@ -255,6 +256,8 @@ def auto_wrap_ass_file(
     def process_dialogue_line(match):
         """处理每一行对话"""
         full_line = match.group(0)
+        if contains_ass_drawing(full_line):
+            return full_line
 
         # 提取样式名称（Dialogue 行的第4个字段）
         style_pattern = r"Dialogue:[^,]*,[^,]*,[^,]*,([^,]*),"

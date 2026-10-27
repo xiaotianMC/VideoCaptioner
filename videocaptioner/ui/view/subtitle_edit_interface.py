@@ -1,5 +1,6 @@
 """Video preview and a draggable subtitle timeline using Qt's media backend."""
 
+import copy
 import json
 import math
 from pathlib import Path
@@ -44,9 +45,11 @@ from qfluentwidgets import (
 from qfluentwidgets import FluentIcon as FIF
 
 from videocaptioner.config import APPDATA_PATH
+from videocaptioner.core.subtitle.drawing import AssRectangle, contains_ass_drawing
 from videocaptioner.core.subtitle.timeline import SubtitleTimeline, adjusted_times
 from videocaptioner.ui.common.config import cfg
 from videocaptioner.ui.components.ffmpeg_preview import FFmpegPreview, PreviewFrame
+from videocaptioner.ui.components.rectangle_dialog import RectangleDialog
 
 
 def time_label(ms):
@@ -125,10 +128,18 @@ class SubtitleTrack(QAbstractScrollArea):
         start, end = seg.start_time, seg.end_time
         if self.drag and self.drag[0] == index:
             start, end = self.drag[4:6]
-        return QRectF(self.x(start), 40 + lane * 58, max(3, (end - start) * self.scale / 1000), 44)
+        drawings = self.document.has_drawings()
+        return QRectF(
+            self.x(start),
+            (36 + lane * 42) if drawings else (40 + lane * 58),
+            max(3, (end - start) * self.scale / 1000),
+            34 if drawings else 44,
+        )
 
     def lanes(self, index):
         seg = self.document.data.segments[index]
+        if contains_ass_drawing(seg.text):
+            return [2]
         if self.document.ass_events:
             return [self.document.lane(index)]
         return [0, 1] if seg.translated_text else [0]
@@ -141,12 +152,19 @@ class SubtitleTrack(QAbstractScrollArea):
         border = QColor("#454545" if dark else "#e5e5e5")
         text_color = QColor("#ffffff" if dark else "#1a1a1a")
         muted = QColor("#c5c5c5" if dark else "#606060")
+        drawings = self.document.has_drawings()
         p = QPainter(self.viewport())
         p.setRenderHint(QPainter.Antialiasing)
         p.fillRect(self.viewport().rect(), background)
         p.setClipRect(80, 0, max(0, self.viewport().width() - 80), self.viewport().height())
         p.fillRect(80, 0, self.viewport().width() - 80, 32, surface)
-        p.fillRect(80, 94, self.viewport().width() - 80, 54, surface)
+        p.fillRect(
+            80,
+            74 if drawings else 94,
+            self.viewport().width() - 80,
+            42 if drawings else 54,
+            surface,
+        )
         step = 1000 * max(1, math.ceil(65 / self.scale))
         first = self.ms(80) // step * step
         for ms in range(first, self.ms(self.viewport().width()) + step, step):
@@ -177,8 +195,9 @@ class SubtitleTrack(QAbstractScrollArea):
                 p.drawText(rect.adjusted(9, 4, -6, -4), Qt.AlignVCenter, text.replace("\n", " / "))
                 p.restore()
                 p.setPen(accent if index == self.current else muted)
+                grip = min(14, int(rect.height() / 3))
                 for x in (rect.left() + 4, rect.right() - 4):
-                    p.drawLine(int(x), int(rect.top() + 17), int(x), int(rect.bottom() - 17))
+                    p.drawLine(int(x), int(rect.top() + grip), int(x), int(rect.bottom() - grip))
         p.setPen(QPen(accent, 2))
         p.drawLine(int(self.x(self.position)), 28, int(self.x(self.position)), 154)
         p.setClipping(False)
@@ -186,8 +205,14 @@ class SubtitleTrack(QAbstractScrollArea):
         p.setPen(border)
         p.drawLine(79, 0, 79, self.viewport().height())
         p.setPen(text_color)
-        p.drawText(QRectF(8, 40, 65, 44), Qt.AlignVCenter, "字幕")
-        p.drawText(QRectF(8, 98, 65, 44), Qt.AlignVCenter, "副字幕")
+        p.drawText(
+            QRectF(8, 36 if drawings else 40, 65, 34 if drawings else 44), Qt.AlignVCenter, "字幕"
+        )
+        p.drawText(
+            QRectF(8, 78 if drawings else 98, 65, 34 if drawings else 44), Qt.AlignVCenter, "副字幕"
+        )
+        if drawings:
+            p.drawText(QRectF(8, 120, 65, 34), Qt.AlignVCenter, "图形")
         p.setPen(muted)
         p.drawText(
             QRectF(8, 163, self.viewport().width() - 8, 22),
@@ -287,6 +312,22 @@ class EditSubtitle(QUndoCommand):
         self.editor.apply_state(self.index, self.before)
 
 
+class AddRectangle(QUndoCommand):
+    def __init__(self, editor, rectangle, start, end):
+        super().__init__("添加矩形")
+        self.editor, self.rectangle, self.start, self.end = editor, rectangle, start, end
+        self.before = copy.deepcopy(editor.document.to_dict())
+        self.previous_row = editor.current
+
+    def redo(self):
+        row = self.editor.document.add_rectangle(self.rectangle, self.start, self.end)
+        self.editor.rectangle_changed(row)
+
+    def undo(self):
+        self.editor.document = SubtitleTimeline.from_dict(self.before)
+        self.editor.rectangle_changed(self.previous_row)
+
+
 class SubtitleEditInterface(QWidget):
     finished = pyqtSignal(str, str)
 
@@ -302,6 +343,7 @@ class SubtitleEditInterface(QWidget):
         self.media_duration = 0
         self.playback_requested = False
         self.unsaved_changes = False
+        self.empty_draft_changed = False
         self.draft_path = (
             Path(draft_path) if draft_path else APPDATA_PATH / "subtitle-edit-draft.json"
         )
@@ -326,6 +368,9 @@ class SubtitleEditInterface(QWidget):
         self.undo_stack.canRedoChanged.connect(self.redo_button.setEnabled)
         QShortcut(QKeySequence.Undo, self, activated=self.undo_stack.undo)
         QShortcut(QKeySequence.Redo, self, activated=self.undo_stack.redo)
+        QShortcut(
+            QKeySequence("Escape"), self, activated=lambda: self.draw_action.setChecked(False)
+        )
         # aboutToQuit also runs when the parent window quits without closing its pages.
         from PyQt5.QtWidgets import QApplication
 
@@ -365,6 +410,13 @@ class SubtitleEditInterface(QWidget):
         self.redo_button.setEnabled(False)
         self.command_bar.addAction(self.undo_button)
         self.command_bar.addAction(self.redo_button)
+        self.command_bar.addSeparator()
+        self.draw_action = Action(FIF.BRUSH, "绘制矩形", checkable=True)
+        self.draw_action.toggled.connect(self.toggle_rectangle_drawing)
+        self.draw_action.setToolTip("点击后在视频画面上拖拽绘制矩形，再次点击取消")
+        self.command_bar.addAction(self.draw_action)
+        self.rectangle_action = Action(FIF.EDIT, "矩形属性", triggered=self.edit_rectangle)
+        self.command_bar.addAction(self.rectangle_action)
         toolbar.addWidget(self.command_bar, 1)
         self.continue_button = PrimaryPushButton("保存并继续合成", self, icon=FIF.CHEVRON_RIGHT)
         self.continue_button.setFixedHeight(34)
@@ -389,6 +441,7 @@ class SubtitleEditInterface(QWidget):
         self.preview_stack = QStackedWidget(preview)
         self.preview_stack.addWidget(self.video_widget)
         self.fallback_frame = PreviewFrame(preview)
+        self.fallback_frame.rectangleDrawn.connect(self.rectangle_drawn)
         self.preview_stack.addWidget(self.fallback_frame)
         preview_layout.addWidget(self.preview_stack, 1)
         self.caption = QLabel("字幕同步预览", preview)
@@ -482,6 +535,10 @@ class SubtitleEditInterface(QWidget):
         self.apply_button.setEnabled(loaded and self.current >= 0)
         self.continue_button.setEnabled(loaded and bool(self.video_path))
         self.play_button.setEnabled(bool(self.video_path))
+        self.draw_action.setEnabled(bool(self.video_path))
+        self.rectangle_action.setEnabled(
+            self.current >= 0 and loaded and self.document.rectangle(self.current) is not None
+        )
 
     def update_files(self):
         self.files_label.setText(
@@ -499,6 +556,7 @@ class SubtitleEditInterface(QWidget):
             self.save_draft()
 
     def set_video(self, path):
+        self.draw_action.setChecked(False)
         self.playback_requested = False
         self.player.stop()
         self.video_path = str(path)
@@ -507,6 +565,8 @@ class SubtitleEditInterface(QWidget):
         self.player.setMedia(QMediaContent(QUrl.fromLocalFile(str(Path(path).resolve()))))
         if self.player is self.native_player:
             self.media_watchdog.start()
+        if self.document.has_drawings():
+            self.use_ffmpeg_preview(drawing=True)
         self.update_files()
         self.track.refresh()
 
@@ -535,6 +595,7 @@ class SubtitleEditInterface(QWidget):
             self.error(f"字幕导入失败：{exc}")
             return False
         self.document = document
+        self.draw_action.setChecked(False)
         self.subtitle_path = str(path)
         self.export_path = ""
         self.unsaved_changes = False
@@ -543,6 +604,8 @@ class SubtitleEditInterface(QWidget):
         self.refresh_table()
         self.update_files()
         self.select_row(0)
+        if self.document.has_drawings() and self.video_path:
+            self.use_ffmpeg_preview(drawing=True)
         self.save_draft()
         return True
 
@@ -597,7 +660,15 @@ class SubtitleEditInterface(QWidget):
         seg = self.document.data.segments[row]
         self.start_input.setValue(seg.start_time / 1000)
         self.end_input.setValue(seg.end_time / 1000)
-        self.text_input.setPlainText(seg.text)
+        rectangle = self.document.rectangle(row)
+        self.text_input.setReadOnly(rectangle is not None)
+        self.text_input.setPlainText(
+            f"矩形：{rectangle.width} × {rectangle.height}，位置（{rectangle.x}, {rectangle.y}）\n"
+            "点击上方“矩形属性”修改外观。"
+            if rectangle
+            else seg.text
+        )
+        self.apply_button.setText("应用时间" if rectangle else "应用修改")
         self.translation_input.setPlainText(seg.translated_text)
         self.translation_input.setEnabled(not bool(self.document.ass_events))
         show_translation = bool(seg.translated_text) and not self.document.ass_events
@@ -612,7 +683,9 @@ class SubtitleEditInterface(QWidget):
         state = (
             round(self.start_input.value() * 1000),
             round(self.end_input.value() * 1000),
-            self.text_input.toPlainText(),
+            self.document.state(self.current)[2]
+            if self.document.rectangle(self.current)
+            else self.text_input.toPlainText(),
             self.translation_input.toPlainText(),
         )
         if state[1] <= state[0] or not state[2].strip():
@@ -622,6 +695,58 @@ class SubtitleEditInterface(QWidget):
             self.error("字幕结束时间不能超过视频时长。")
             return
         self.commit(self.current, state)
+
+    def toggle_rectangle_drawing(self, enabled):
+        if enabled:
+            if not self.video_path:
+                self.draw_action.setChecked(False)
+                return
+            self.playback_requested = False
+            self.player.pause()
+            self.use_ffmpeg_preview(drawing=True)
+            self.status.setText("在视频画面内按住鼠标拖拽绘制矩形；Esc 取消。")
+        self.fallback_frame.canvas_size.setWidth(self.document.resolution()[0])
+        self.fallback_frame.canvas_size.setHeight(self.document.resolution()[1])
+        self.fallback_frame.set_drawing(enabled)
+
+    def rectangle_drawn(self, x, y, width, height):
+        self.draw_action.setChecked(False)
+        rectangle = AssRectangle(x, y, width, height, themeColor().name())
+        dialog = RectangleDialog(rectangle, self.document.resolution(), self.window())
+        dialog.yesButton.setText("添加矩形")
+        if dialog.exec():
+            start = self.track.position
+            end = min(start + 3000, self.media_duration) if self.media_duration else start + 3000
+            if end <= start:
+                self.error("请将播放指针移到视频结束之前再绘制。")
+                return
+            self.add_rectangle(dialog.rectangle(), start, end)
+
+    def add_rectangle(self, rectangle, start, end):
+        self.undo_stack.push(AddRectangle(self, rectangle, start, end))
+
+    def rectangle_changed(self, selected):
+        self.unsaved_changes = True
+        self.empty_draft_changed = not bool(len(self.document.data))
+        if self.document.has_drawings() and self.export_path.lower().endswith(".srt"):
+            self.export_path = ""
+        self.current = self.track.current = -1
+        self.refresh_table()
+        if 0 <= selected < len(self.document.data):
+            self.select_row(selected)
+        elif not len(self.document.data):
+            self.text_input.clear()
+            self.translation_input.clear()
+        self.position_changed(self.track.position)
+        self.autosave.start()
+
+    def edit_rectangle(self):
+        if self.current < 0 or (rectangle := self.document.rectangle(self.current)) is None:
+            return
+        dialog = RectangleDialog(rectangle, self.document.resolution(), self.window())
+        if dialog.exec():
+            state = self.document.state(self.current)
+            self.commit(self.current, (state[0], state[1], dialog.rectangle().to_ass(), ""))
 
     def trim(self, row, start, end):
         state = self.document.state(row)
@@ -659,12 +784,19 @@ class SubtitleEditInterface(QWidget):
         self.track.set_position(ms, self.player.state() == QMediaPlayer.PlayingState)
         self.time_display.setText(f"{time_label(ms)} / {time_label(self.media_duration)}")
         texts = []
+        rectangles = []
         for row, seg in enumerate(self.document.data):
             if seg.start_time <= ms < seg.end_time:
+                if rectangle := self.document.rectangle(row):
+                    rectangles.append(rectangle)
+                    continue
+                if contains_ass_drawing(seg.text):
+                    continue
                 texts.append(self.document.text(row))
                 if seg.translated_text:
                     texts.append(self.document.text(row, True))
         self.caption.setText("\n".join(texts))
+        self.fallback_frame.set_rectangles(rectangles, self.document.resolution())
 
     def duration_changed(self, ms):
         self.media_duration = max(0, ms)
@@ -678,8 +810,10 @@ class SubtitleEditInterface(QWidget):
         if self.native_player.error() != QMediaPlayer.NoError:
             self.use_ffmpeg_preview()
 
-    def use_ffmpeg_preview(self):
+    def use_ffmpeg_preview(self, drawing=False):
         if self.player is not self.native_player or not self.video_path:
+            if drawing and self.video_path:
+                self.backend_label.setText("FFmpeg 绘图预览（无声）")
             return
         self.media_watchdog.stop()
         was_playing = self.playback_requested or self.player.state() == QMediaPlayer.PlayingState
@@ -693,10 +827,13 @@ class SubtitleEditInterface(QWidget):
         self.player = FFmpegPreview(self)
         self.connect_player()
         self.player.frameReady.connect(self.fallback_frame.set_image)
+        self.player.videoSizeChanged.connect(self.fallback_frame.set_video_size)
         self.player.failed.connect(lambda message: self.status.setText("视频预览失败：" + message))
         self.preview_stack.setCurrentWidget(self.fallback_frame)
-        self.backend_label.setText("FFmpeg 画面预览（无声）")
-        self.backend_label.setToolTip("本机 Qt 播放器无法解码此视频，使用 FFmpeg 预览画面。")
+        self.backend_label.setText(
+            "FFmpeg 绘图预览（无声）" if drawing else "FFmpeg 画面预览（无声）"
+        )
+        self.backend_label.setToolTip("使用 FFmpeg 解码视频画面，支持矩形绘制和同步预览。")
         self.player.setMedia(
             QMediaContent(QUrl.fromLocalFile(str(Path(self.video_path).resolve())))
         )
@@ -714,18 +851,19 @@ class SubtitleEditInterface(QWidget):
         if not len(self.document.data):
             self.error("请先导入字幕。")
             return False
-        source = Path(self.subtitle_path)
+        source = Path(self.subtitle_path or self.video_path or "绘图字幕.ass")
+        ass = self.document.ass_events or self.document.has_drawings()
         default = self.export_path or str(
-            source.with_name(
-                source.stem + ".edited" + (".ass" if self.document.ass_events else ".srt")
-            )
+            source.with_name(source.stem + ".edited" + (".ass" if ass else ".srt"))
         )
         path, selected = QFileDialog.getSaveFileName(
             self,
             "另存字幕",
             default,
-            "ASS 字幕 (*.ass);;SRT 字幕 (*.srt)"
-            if self.document.ass_events
+            "ASS 字幕 (*.ass)"
+            if self.document.has_drawings()
+            else "ASS 字幕 (*.ass);;SRT 字幕 (*.srt)"
+            if ass
             else "SRT 字幕 (*.srt);;ASS 字幕 (*.ass)",
         )
         if not path:
@@ -763,7 +901,7 @@ class SubtitleEditInterface(QWidget):
 
     def save_draft(self):
         self.autosave.stop()
-        if not len(self.document.data):
+        if not len(self.document.data) and not self.empty_draft_changed:
             return True
         try:
             self.draft_path.parent.mkdir(parents=True, exist_ok=True)
@@ -786,6 +924,7 @@ class SubtitleEditInterface(QWidget):
             self.status.setText(f"草稿保存失败，请另存字幕：{exc}")
             return False
         self.status.setText("草稿已自动保存；重启可恢复。导出字幕请点击“另存字幕”。")
+        self.empty_draft_changed = False
         return True
 
     def restore_draft(self):

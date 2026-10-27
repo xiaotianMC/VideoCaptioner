@@ -472,6 +472,9 @@ class VideoSynthesisInterface(QWidget):
         if self.task:
             self.video_input.setText(self.task.video_path)
             self.subtitle_input.setText(self.task.subtitle_path)
+            self.soft_subtitle_action.setChecked(self.task.synthesis_config.soft_subtitle)
+            self.render_mode_button.setText(self.task.synthesis_config.render_mode.value)
+            self._update_synthesis_controls_state()
 
     def start_video_synthesis(self, need_create_task=True):
         self.synthesize_button.setEnabled(False)
@@ -479,6 +482,7 @@ class VideoSynthesisInterface(QWidget):
         self.progress_bar.reset()
         if need_create_task:
             self.task = self.create_task()
+            self.update_info()
 
         if self.task:
             self.video_synthesis_thread = VideoSynthesisThread(self.task)
